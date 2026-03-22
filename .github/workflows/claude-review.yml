@@ -1,0 +1,15 @@
+name: Claude PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review]
+
+jobs:
+  review:
+    uses: bluesprig-pediatrics/bsp-dev-platform/.github/workflows/claude-review.yml@main
+    with:
+      model: claude-sonnet-4-6
+      max-turns: 15
+      pre-submit-required: false
+    secrets:
+      anthropic-api-key: ${{ secrets.CLAUDE_GH_ACTIONS_BOTS }}
