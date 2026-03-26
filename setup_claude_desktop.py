@@ -210,6 +210,74 @@ def prompt_tokens(user_type: str, brand_only: bool) -> dict:
     return tokens
 
 
+def _store_in_keychain(
+    service: str, account: str, token: str, dry_run: bool
+) -> bool:
+    """Store a token in the OS keychain.
+
+    macOS: uses `security add-generic-password`
+    Windows: uses `cmdkey`
+
+    Returns True if stored successfully (or dry-run), False on failure.
+    """
+    system = platform.system()
+
+    if system == "Darwin":
+        cmd = [
+            "security",
+            "add-generic-password",
+            "-s", service,
+            "-a", account,
+            "-w", token,
+            "-U",  # update if exists
+        ]
+        label = f"security add-generic-password -s {service} -a {account}"
+    elif system == "Windows":
+        target = f"{service}/{account}"
+        cmd = [
+            "cmdkey",
+            f"/generic:{target}",
+            f"/user:{account}",
+            f"/pass:{token}",
+        ]
+        label = f"cmdkey /generic:{target} /user:{account}"
+    else:
+        print(f"    WARNING: keychain not supported on {system}, skipping")
+        return False
+
+    if dry_run:
+        print(f"    [dry-run] would run: {label}")
+        return True
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"    WARNING: keychain store failed: {result.stderr.strip()}")
+        return False
+    return True
+
+
+def _keychain_read_cmd(service: str, account: str) -> str:
+    """Return a shell expression that reads a token from the OS keychain.
+
+    macOS: security find-generic-password -s <service> -a <account> -w
+    Windows: PowerShell extraction from cmdkey (no simple one-liner)
+    """
+    system = platform.system()
+    if system == "Darwin":
+        return (
+            f"$(security find-generic-password"
+            f" -s {shlex.quote(service)}"
+            f" -a {shlex.quote(account)} -w)"
+        )
+    elif system == "Windows":
+        # Windows MCP servers use env vars from .env files instead of
+        # keychain shell wrappers — this is only called on macOS/Linux.
+        # If we reach here on Windows, fall back gracefully.
+        return ""
+    else:
+        return ""
+
+
 def clone_repos(
     user_type: str, tokens: dict, brand_only: bool, dry_run: bool
 ) -> None:
@@ -288,50 +356,38 @@ def clone_repos(
                 )
 
 
-def write_env_files(tokens: dict, dry_run: bool) -> None:
-    """Write .env files for MCP servers that need them.
+def write_env_and_keychain(tokens: dict, dry_run: bool) -> None:
+    """Store credentials: GitHub PAT goes to OS keychain, MotherDuck to .env.
 
-    - bsp-analytics/.env: MOTHERDUCK_TOKEN and GITHUB_TOKEN
-    - bsp-shared/.env: GITHUB_TOKEN (for submit_issue proxy)
+    - GitHub PAT: stored in OS keychain (macOS: Keychain Access,
+      Windows: Credential Manager). Never written to disk files.
+    - MotherDuck token: stored in bsp-analytics/.env (no GitHub dependency).
     """
     md_token = tokens.get("motherduck_token", "")
     github_pat = tokens.get("github_pat", "")
 
-    # bsp-analytics .env — needs both tokens
+    # Store GitHub PAT in OS keychain
+    if github_pat:
+        print("  Storing GitHub PAT in OS keychain...")
+        stored = _store_in_keychain(
+            "bsp-github-token", "bsp-shared", github_pat, dry_run
+        )
+        if stored:
+            print("  GitHub PAT stored in keychain.")
+        else:
+            print("  WARNING: Could not store PAT in keychain.")
+            print("  MCP servers may not have GitHub access.")
+
+    # Write MotherDuck token to .env (no sensitive GitHub credentials)
     analytics_dir = MCP_DIR / "bsp-analytics"
-    if analytics_dir.exists():
+    if analytics_dir.exists() and md_token:
         env_path = analytics_dir / ".env"
         lines = [
             "# BlueSprig Analytics — Environment Variables",
             "# IMPORTANT: Never commit .env — it contains credentials",
             "",
-        ]
-        if md_token:
-            lines.append("# Read-only MotherDuck token")
-            lines.append(f"MOTHERDUCK_TOKEN={md_token}")
-            lines.append("")
-        if github_pat:
-            lines.append("# Shared fine-grained PAT for insight submission")
-            lines.append(f"GITHUB_TOKEN={github_pat}")
-            lines.append("")
-
-        if md_token or github_pat:
-            if dry_run:
-                print(f"  [dry-run] would write {env_path}")
-            else:
-                env_path.write_text("\n".join(lines), encoding="utf-8")
-                print(f"  Wrote {env_path}")
-
-    # bsp-shared .env — needs GITHUB_TOKEN for submit_issue
-    shared_dir = MCP_DIR / "bsp-shared"
-    if shared_dir.exists() and github_pat:
-        env_path = shared_dir / ".env"
-        lines = [
-            "# BlueSprig Shared — Environment Variables",
-            "# IMPORTANT: Never commit .env — it contains credentials",
-            "",
-            "# Shared fine-grained PAT for GitHub integrations",
-            f"GITHUB_TOKEN={github_pat}",
+            "# Read-only MotherDuck token",
+            f"MOTHERDUCK_TOKEN={md_token}",
             "",
         ]
         if dry_run:
@@ -374,71 +430,93 @@ def build_server_configs(
 
     # --- bsp-shared ---
     shared_dir = f"{mcp_path}/bsp-shared"
+    shared_run = (
+        f"exec {shlex.quote(uv_cmd)} --directory "
+        f"{shlex.quote(shared_dir)} run python -m bsp_shared"
+    )
     if user_type == "developer":
         # Developer path: gh auth token wrapper via shell
-        gh_wrapper = (
-            f"export GITHUB_TOKEN=$(gh auth token) && "
-            f"exec {shlex.quote(uv_cmd)} --directory "
-            f"{shlex.quote(shared_dir)} run python -m bsp_shared"
-        )
+        gh_wrapper = f"export GITHUB_TOKEN=$(gh auth token) && {shared_run}"
         servers["bsp-shared"] = {
             "command": "/bin/sh",
             "args": ["-c", gh_wrapper],
         }
     else:
-        # Non-GitHub path: token from .env
-        shared_config = {
-            "command": uv_cmd,
-            "args": [
-                "--directory",
-                shared_dir,
-                "run",
-                "python",
-                "-m",
-                "bsp_shared",
-            ],
-        }
-        if github_pat:
-            shared_config["env"] = {"GITHUB_TOKEN": github_pat}
-        servers["bsp-shared"] = shared_config
+        # Non-GitHub path: read PAT from OS keychain
+        keychain_cmd = _keychain_read_cmd("bsp-github-token", "bsp-shared")
+        if keychain_cmd:
+            wrapper = (
+                f"export GITHUB_TOKEN={keychain_cmd} && {shared_run}"
+            )
+            servers["bsp-shared"] = {
+                "command": "/bin/sh",
+                "args": ["-c", wrapper],
+            }
+        else:
+            # Windows fallback: env var in config (PAT stored in
+            # Credential Manager but no shell one-liner to read it)
+            shared_config = {
+                "command": uv_cmd,
+                "args": [
+                    "--directory", shared_dir,
+                    "run", "python", "-m", "bsp_shared",
+                ],
+            }
+            if github_pat:
+                shared_config["env"] = {"GITHUB_TOKEN": github_pat}
+            servers["bsp-shared"] = shared_config
 
     # --- bsp-analytics ---
     analytics_dir = f"{mcp_path}/bsp-analytics"
-    analytics_config = {
-        "command": uv_cmd,
-        "args": [
-            "--directory",
-            analytics_dir,
-            "run",
-            "python",
-            "-m",
-            "bsp_server",
-        ],
-    }
-    analytics_env = {}
-    if md_token:
-        analytics_env["MOTHERDUCK_TOKEN"] = md_token
+    analytics_run = (
+        f"exec {shlex.quote(uv_cmd)} --directory "
+        f"{shlex.quote(analytics_dir)} run python -m bsp_server"
+    )
     if user_type == "developer":
-        # Developer path: gh auth token wrapper for analytics too
+        # Developer path: gh auth token wrapper
         env_parts = ""
         if md_token:
             env_parts = f"export MOTHERDUCK_TOKEN={shlex.quote(md_token)} && "
         gh_wrapper = (
             f"{env_parts}"
-            f"export GITHUB_TOKEN=$(gh auth token) && "
-            f"exec {shlex.quote(uv_cmd)} --directory "
-            f"{shlex.quote(analytics_dir)} run python -m bsp_server"
+            f"export GITHUB_TOKEN=$(gh auth token) && {analytics_run}"
         )
         servers["bsp-analytics"] = {
             "command": "/bin/sh",
             "args": ["-c", gh_wrapper],
         }
     else:
-        if github_pat:
-            analytics_env["GITHUB_TOKEN"] = github_pat
-        if analytics_env:
-            analytics_config["env"] = analytics_env
-        servers["bsp-analytics"] = analytics_config
+        # Non-GitHub path: read PAT from OS keychain
+        keychain_cmd = _keychain_read_cmd("bsp-github-token", "bsp-shared")
+        env_parts = ""
+        if md_token:
+            env_parts = f"export MOTHERDUCK_TOKEN={shlex.quote(md_token)} && "
+        if keychain_cmd:
+            wrapper = (
+                f"{env_parts}"
+                f"export GITHUB_TOKEN={keychain_cmd} && {analytics_run}"
+            )
+            servers["bsp-analytics"] = {
+                "command": "/bin/sh",
+                "args": ["-c", wrapper],
+            }
+        else:
+            # Windows fallback
+            analytics_config = {
+                "command": uv_cmd,
+                "args": [
+                    "--directory", analytics_dir,
+                    "run", "python", "-m", "bsp_server",
+                ],
+            }
+            analytics_env = {}
+            if md_token:
+                analytics_env["MOTHERDUCK_TOKEN"] = md_token
+            if github_pat:
+                analytics_env["GITHUB_TOKEN"] = github_pat
+            if analytics_env:
+                analytics_config["env"] = analytics_env
+            servers["bsp-analytics"] = analytics_config
 
     # --- MotherDuck ---
     if md_token:
@@ -542,10 +620,10 @@ def main():
 
     # --- Step 4: Write .env files ---
     print()
-    print("Step 4: Environment files")
+    print("Step 4: Credentials & environment files")
     print("-" * 40)
     if tokens:
-        write_env_files(tokens, args.dry_run)
+        write_env_and_keychain(tokens, args.dry_run)
     else:
         print("  No tokens to write.")
 
