@@ -14,7 +14,7 @@ CMD=$(jq -r '.tool_input.command' 2>/dev/null)
 
 # Check 1: PR creation or readying
 if echo "$CMD" | grep -qE "gh pr (create|ready)"; then
-  if git log -1 --format=%B 2>/dev/null | grep -qE '^Pre-Submit:\s*pass\s*$'; then
+  if git log -1 --format=%B 2>/dev/null | grep -qE '^Pre-Submit:[[:space:]]*pass[[:space:]]*$'; then
     exit 0
   fi
   printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"HEAD commit missing Pre-Submit: pass trailer. Run /pre-submit first."}}'
@@ -34,7 +34,7 @@ if echo "$CMD" | grep -qE "^git push"; then
     exit 0
   fi
 
-  if git log -1 --format=%B 2>/dev/null | grep -qE '^Pre-Submit:\s*pass\s*$'; then
+  if git log -1 --format=%B 2>/dev/null | grep -qE '^Pre-Submit:[[:space:]]*pass[[:space:]]*$'; then
     exit 0
   fi
 
