@@ -331,15 +331,16 @@ def clone_repos(
                 print(f"    ERROR: clone failed: {result.stderr.strip()}")
                 continue
 
-        # Run uv sync in the cloned repo
+        # Run uv sync — some repos keep pyproject.toml in mcp/ subdirectory
         uv_cmd = _find_uv()
-        print(f"  {repo_name}: running uv sync...")
+        sync_dir = repo_dir / "mcp" if (repo_dir / "mcp" / "pyproject.toml").exists() else repo_dir
+        print(f"  {repo_name}: running uv sync in {sync_dir.name}/...")
         if dry_run:
-            print(f"    [dry-run] would run: {uv_cmd} sync in {repo_dir}")
+            print(f"    [dry-run] would run: {uv_cmd} sync in {sync_dir}")
             continue
         result = subprocess.run(
             [uv_cmd, "sync"],
-            cwd=str(repo_dir),
+            cwd=str(sync_dir),
             capture_output=True,
             text=True,
         )
@@ -429,10 +430,10 @@ def build_server_configs(
         return servers
 
     # --- bsp-shared ---
-    shared_dir = f"{mcp_path}/bsp-shared"
+    shared_dir = f"{mcp_path}/bsp-shared/mcp"
     shared_run = (
         f"exec {shlex.quote(uv_cmd)} --directory "
-        f"{shlex.quote(shared_dir)} run python -m bsp_shared"
+        f"{shlex.quote(shared_dir)} run python bsp_shared_server.py"
     )
     if user_type == "developer":
         # Developer path: gh auth token wrapper via shell
@@ -459,7 +460,7 @@ def build_server_configs(
                 "command": uv_cmd,
                 "args": [
                     "--directory", shared_dir,
-                    "run", "python", "-m", "bsp_shared",
+                    "run", "python", "bsp_shared_server.py",
                 ],
             }
             if github_pat:
